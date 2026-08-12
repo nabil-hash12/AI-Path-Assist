@@ -1,0 +1,119 @@
+const nodemailer = require("nodemailer");
+const { createConnection } = require("../queue/connection");
+
+// Redis client for OTP storage (separate from BullMQ connections so OTP ops
+// don't interfere with job queue operations).
+let redisClient = null;
+function getRedis() {
+  if (!redisClient) {
+    redisClient = createConnection();
+    redisClient.on("error", (err) => {
+      // eslint-disable-next-line no-console
+      console.error("[otp] Redis error:", err.message);
+    });
+  }
+  return redisClient;
+}
+
+// ─── Nodemailer transporter (lazy-init so server starts even if Gmail creds
+// aren't configured yet — jobs will fail gracefully with a clear error) ──────
+let transporter = null;
+function getTransporter() {
+  if (transporter) return transporter;
+  const user = process.env.GMAIL_USER;
+  const pass = process.env.GMAIL_APP_PASSWORD;
+  if (!user || !pass || user.startsWith("your_gmail")) {
+    return null; // not configured yet
+  }
+  transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: { user, pass },
+  });
+  return transporter;
+}
+
+// ─── OTP helpers ──────────────────────────────────────────────────────────
+
+const OTP_EXPIRY = Number(process.env.OTP_EXPIRY_SECONDS || 600);
+const OTP_PREFIX = "aipath:otp:";
+
+/** Generate a cryptographically random 6-digit OTP. */
+function generateOTP() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+/** Store OTP in Redis with TTL. Returns the generated code. */
+async function storeOTP(email, code) {
+  const redis = getRedis();
+  await redis.set(`${OTP_PREFIX}${email.toLowerCase()}`, code, "EX", OTP_EXPIRY);
+  return code;
+}
+
+/** Verify a submitted OTP against the stored value. Deletes it on success. */
+async function verifyOTP(email, submitted) {
+  const redis = getRedis();
+  const key = `${OTP_PREFIX}${email.toLowerCase()}`;
+  const stored = await redis.get(key);
+  if (!stored) return { ok: false, reason: "expired" };
+  if (stored !== String(submitted).trim()) return { ok: false, reason: "invalid" };
+  await redis.del(key);
+  return { ok: true };
+}
+
+/** Send the OTP to the user's registered email address via Gmail. */
+async function sendOTPEmail(toEmail, code) {
+  const t = getTransporter();
+  if (!t) {
+    // Provide a clear server-side error so the developer knows what to configure.
+    throw new Error(
+      "Email is not configured. Add GMAIL_USER and GMAIL_APP_PASSWORD to backend/.env. " +
+        "Get an App Password at: myaccount.google.com → Security → 2-Step Verification → App passwords"
+    );
+  }
+
+  const fromName = process.env.OTP_FROM_NAME || "AI-Path Assist";
+  const from = `"${fromName}" <${process.env.GMAIL_USER}>`;
+  const expiryMinutes = Math.round(OTP_EXPIRY / 60);
+
+  await t.sendMail({
+    from,
+    to: toEmail,
+    subject: `${code} — Your AI-Path Assist verification code`,
+    text: [
+      `Your AI-Path Assist two-factor authentication code is:`,
+      ``,
+      `  ${code}`,
+      ``,
+      `This code expires in ${expiryMinutes} minutes.`,
+      `If you did not request this, someone may be attempting to sign in to your account.`,
+      ``,
+      `— AI-Path Assist Security`,
+    ].join("\n"),
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:system-ui,sans-serif;background:#f5f5f5;margin:0;padding:24px">
+  <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)">
+    <div style="background:#1a2b4c;padding:24px 32px">
+      <p style="margin:0;color:#9ecfff;font-size:12px;letter-spacing:1px;text-transform:uppercase">AI-Path Assist</p>
+      <h1 style="margin:8px 0 0;color:#fff;font-size:20px;font-weight:600">Two-Factor Verification</h1>
+    </div>
+    <div style="padding:32px">
+      <p style="margin:0 0 24px;color:#444;font-size:15px">Use this code to complete your sign-in:</p>
+      <div style="text-align:center;margin:0 0 28px">
+        <span style="display:inline-block;font-size:40px;font-weight:700;letter-spacing:10px;color:#1a2b4c;font-family:monospace;background:#f0f4ff;padding:16px 28px;border-radius:10px;border:2px solid #d0deff">${code}</span>
+      </div>
+      <p style="margin:0 0 8px;color:#666;font-size:13px">This code expires in <strong>${expiryMinutes} minutes</strong>.</p>
+      <p style="margin:0;color:#999;font-size:12px">If you did not attempt to sign in, please ignore this email and consider changing your password.</p>
+    </div>
+    <div style="background:#f9f9f9;padding:16px 32px;border-top:1px solid #eee">
+      <p style="margin:0;color:#bbb;font-size:11px">AI-Path Assist — Clinical Pathology Intelligence Platform</p>
+    </div>
+  </div>
+</body>
+</html>`,
+  });
+}
+
+module.exports = { generateOTP, storeOTP, verifyOTP, sendOTPEmail };

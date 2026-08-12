@@ -1,0 +1,158 @@
+const express = require("express");
+const jwt = require("jsonwebtoken");
+const users = require("../models/users");
+const misc = require("../models/misc");
+const { signToken, requireAuth, JWT_SECRET } = require("../middleware/auth");
+const { generateOTP, storeOTP, verifyOTP, sendOTPEmail } = require("../lib/otp");
+
+const router = express.Router();
+
+const VALID_ROLES = ["admin", "pathologist", "lab_tech", "researcher"];
+
+// ─── Step 1: validate credentials, store OTP, send email ──────────────────
+router.post("/login", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "email and password are required." });
+
+  const user = await users.findByEmail(email);
+  if (!user || !users.verifyPassword(user, password)) {
+    return res.status(401).json({ error: "Invalid email or password." });
+  }
+  if (user.status === "Deactivated") {
+    return res.status(403).json({ error: "This account has been deactivated. Contact your administrator." });
+  }
+
+  const code = generateOTP();
+  await storeOTP(email, code);
+
+  try {
+    await sendOTPEmail(email, code);
+  } catch (err) {
+    // If email is not configured (dev environment), return the code in the
+    // response body so the developer can still log in and test without
+    // actual Gmail credentials. In production, remove this fallback.
+    const devMode = err.message.startsWith("Email is not configured");
+    if (devMode) {
+      // eslint-disable-next-line no-console
+      console.warn(`[2FA] Email not configured. DEV MODE — OTP for ${email}: ${code}`);
+      return res.json({
+        pending: true,
+        message: `Verification code sent to ${email}`,
+        // Only exposed in dev — remove in production:
+        _devOtp: process.env.NODE_ENV !== "production" ? code : undefined,
+      });
+    }
+    // Real email error (e.g. wrong App Password) — surface it clearly.
+    // eslint-disable-next-line no-console
+    console.error("[2FA] Failed to send OTP email:", err.message);
+    return res.status(502).json({ error: `Failed to send verification email: ${err.message}` });
+  }
+
+  res.json({
+    pending: true,
+    message: `Verification code sent to ${email}`,
+  });
+});
+
+// ─── Step 2: verify OTP → issue full JWT ──────────────────────────────────
+router.post("/verify-otp", async (req, res) => {
+  const { email, otp } = req.body || {};
+  if (!email || !otp) return res.status(400).json({ error: "email and otp are required." });
+
+  const result = await verifyOTP(email, otp);
+  if (!result.ok) {
+    const message =
+      result.reason === "expired"
+        ? "Verification code has expired. Please sign in again."
+        : "Incorrect verification code. Please try again.";
+    return res.status(401).json({ error: message });
+  }
+
+  const user = await users.findByEmail(email);
+  if (!user) return res.status(401).json({ error: "User not found." });
+
+  await users.touchLogin(user.id);
+  await misc.logAction({ actorId: user.id, actorName: user.name, action: "Logged in (2FA verified)", target: "Auth" });
+
+  const token = signToken(user);
+  res.json({ token, user: users.toPublic(user) });
+});
+
+// ─── Resend OTP ───────────────────────────────────────────────────────────
+router.post("/resend-otp", async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: "email is required." });
+
+  const user = await users.findByEmail(email);
+  if (!user) return res.status(404).json({ error: "No account found for this email." });
+
+  const code = generateOTP();
+  await storeOTP(email, code);
+
+  try {
+    await sendOTPEmail(email, code);
+  } catch (err) {
+    const devMode = err.message.startsWith("Email is not configured");
+    if (devMode) {
+      // eslint-disable-next-line no-console
+      console.warn(`[2FA] Resend — DEV MODE OTP for ${email}: ${code}`);
+      return res.json({
+        ok: true,
+        message: `New code sent to ${email}`,
+        _devOtp: process.env.NODE_ENV !== "production" ? code : undefined,
+      });
+    }
+    return res.status(502).json({ error: `Failed to send verification email: ${err.message}` });
+  }
+
+  res.json({ ok: true, message: `New verification code sent to ${email}` });
+});
+
+// ─── Register ─────────────────────────────────────────────────────────────
+router.post("/register", async (req, res) => {
+  const { name, email, password, role, institution } = req.body || {};
+  if (!name || !email || !password || !role) {
+    return res.status(400).json({ error: "name, email, password, and role are required." });
+  }
+  if (!VALID_ROLES.includes(role)) {
+    return res.status(400).json({ error: `role must be one of: ${VALID_ROLES.join(", ")}` });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ error: "Password must be at least 6 characters." });
+  }
+  if (await users.findByEmail(email)) {
+    return res.status(409).json({ error: "An account with this email already exists." });
+  }
+  const user = await users.create({ name, email, password, role, institution });
+  await misc.logAction({ actorId: user.id, actorName: user.name, action: "Registered new account", target: user.email });
+
+  // After registration, trigger the 2FA flow rather than issuing a JWT
+  // immediately — this ensures even newly registered accounts verify email.
+  const code = generateOTP();
+  await storeOTP(email, code);
+
+  try {
+    await sendOTPEmail(email, code);
+  } catch (err) {
+    const devMode = err.message.startsWith("Email is not configured");
+    if (devMode) {
+      // eslint-disable-next-line no-console
+      console.warn(`[2FA] Registration — DEV MODE OTP for ${email}: ${code}`);
+      return res.status(201).json({
+        pending: true,
+        message: `Account created. Verification code sent to ${email}`,
+        _devOtp: process.env.NODE_ENV !== "production" ? code : undefined,
+      });
+    }
+    return res.status(502).json({ error: `Account created but failed to send verification email: ${err.message}` });
+  }
+
+  res.status(201).json({ pending: true, message: `Account created. Verification code sent to ${email}` });
+});
+
+// ─── Me (verify active session) ───────────────────────────────────────────
+router.get("/me", requireAuth, (req, res) => {
+  res.json({ user: users.toPublic(req.user) });
+});
+
+module.exports = router;
